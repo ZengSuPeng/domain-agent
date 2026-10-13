@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>域名检测智能体</title>
+  <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <script src="https://unpkg.com/element-plus"></script>
+  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+  <style>
+    body { background: #f5f7fa; margin: 0; }
+    #app { max-width: 100%; margin: 20px auto; padding: 0 12px; box-sizing: border-box; }
+    #app * { box-sizing: border-box; }
+
+    /* ===== 关键修复：强制 el-card 的 body 走块级布局 ===== */
+    .el-card__body {
+      display: block !important;
+      position: relative;
+      overflow: visible;
+    }
+    /* 让 body 的直接子元素都是独立块，禁止被压缩、禁止绝对定位 */
+    .el-card__body > * {
+      display: block;
+      width: 100%;
+      flex-shrink: 0;
+      position: static;
+    }
+
+    /* 内容包装器：把思考区+分割线+结果表格包起来，形成稳定文档流 */
+    .content-wrapper {
+      display: block;
+      width: 100%;
+      margin-top: 8px;
+    }
+    .content-wrapper > * {
+      display: block;
+      width: 100%;
+      flex-shrink: 0;
+      position: static;
+    }
+
+    /* 思考过程折叠区 */
+    .thinking-box {
+      display: block;
+      width: 100%;
+      margin: 16px 0;
+      border: 1px solid #ebeef5;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .thinking-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: #f4f4f5;
+      cursor: pointer;
+      font-size: 14px;
+      color: #606266;
+      user-select: none;
+    }
+    .thinking-header:hover { background: #e9e9eb; }
+    .thinking-header .arrow {
+      display: inline-block;
+      transition: transform 0.2s;
+      font-size: 12px;
+      margin-left: 6px;
+    }
+    .thinking-header .arrow.expanded { transform: rotate(90deg); }
+    .thinking-body {
+      display: block;
+      padding: 12px 14px;
+      background: #fafafa;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #909399;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-wrap: break-word;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .thinking-badge {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 10px;
+      background: #ecf5ff;
+      color: #409eff;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+
+    /* 结果表格区域 */
+    .result-table {
+      display: block;
+      width: 100%;
+      margin: 16% 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .result-table .el-table {
+      width: 100% !important;
+    }
+    .result-table .el-table .cell {
+      word-break: break-all;
+      overflow-wrap: break-word;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  {% raw %}
+  <div id="app">
+    <el-card>
+      <template #header>
+        <div style="font-size: 20px; font-weight: bold;">🌐 域名检测智能体</div>
+      </template>
+
+      <el-form :model="form" label-width="100px">
+        <el-form-item label="主题">
+          <el-input v-model="form.theme" placeholder="例如：衣服" />
+        </el-form-item>
+
+        <el-form-item label="风格描述">
+          <el-input
+            v-model="form.desc"
+            type="textarea"
+            :rows="3"
+            placeholder="例如：女装，连衣裙，短裙系列"
+          />
+        </el-form-item>
+
+        <el-form-item>
+          <el-button type="primary" :loading="loading" @click="handleGenerate">
+            {{ loading ? '生成中...' : '开始生成' }}
+          </el-button>
+        </el-form-item>
+      </el-form>
+
+      <!-- 内容区域：思考区 + 分割线 + 结果表格，统一包进块级容器 -->
+      <div class=" " v-if="thinking || domains.length > 0">
+        <!-- 思考过程（可折叠） -->
+        <div class="thinking-box" v-if="thinking">
+          <div class="thinking-header" @click="thinkingExpanded = !thinkingExpanded">
+            <span>
+              💭 思考过程
+              <span class="thinking-badge">点击{{ thinkingExpanded ? '收起' : '展开' }}</span>
+            </span>
+            <span class="arrow" :class="{ expanded: thinkingExpanded }">▶</span>
+          </div>
+          <div class="thinking-body" v-show="thinkingExpanded">{{ thinking }}</div>
+        </div>
+
+        <el-divider v-if="domains.length > 0" />
+
+        <div class="result-table" v-if="domains.length > 0">
+          <el-table :data="domains" border stripe>
+            <el-table-column type="index" label="#" width="55" align="center" />
+            <el-table-column prop="domain" label="域名" width="180" align="center">
+              <template #default="{ row }">
+                <el-tag type="success">{{ row.domain }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="reason" label="生成理由" min-width="300" show-overflow-tooltip />
+          </el-table>
+        </div>
+      </div>
+
+      <el-empty v-if="!loading && domains.length === 0 && !thinking" description="还没有生成结果" />
+    </el-card>
+  </div>
+  {% endraw %}
+
+  <script>
+    const { createApp, ref, nextTick } = Vue;
+
+    createApp({
+      setup() {
+        const form = ref({ theme: '衣服', desc: '女装，连衣裙，短裙系列' });
+        const domains = ref([]);
+        const loading = ref(false);
+        const thinking = ref('');
+        const thinkingExpanded = ref(false);
+        let abortController = null;
+
+        async function handleGenerate() {
+          if (!form.value.theme || !form.value.desc) {
+            ElementPlus.ElMessage.warning('请填写主题和风格描述');
+            return;
+          }
+          if (abortController) abortController.abort();
+          abortController = new AbortController();
+
+          loading.value = true;
+          domains.value = [];
+          thinking.value = '';
+          thinkingExpanded.value = true;
+
+          try {
+            const resp = await fetch('/api/generate/stream', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(form.value),
+              signal: abortController.signal,
+            });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+            let currentEvent = '';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+
+              let idx;
+              while ((idx = buffer.indexOf('\n')) >= 0) {
+                const line = buffer.slice(0, idx).trim();
+                buffer = buffer.slice(idx + 1);
+                if (!line) continue;
+                if (line.startsWith('event:')) {
+                  currentEvent = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                  const raw = line.slice(5).trim();
+                  if (!raw) continue;
+                  let payload;
+                  try { payload = JSON.parse(raw); } catch { payload = raw; }
+                  handleSSE(currentEvent, payload);
+                  currentEvent = '';
+                }
+              }
+            }
+          } catch (e) {
+            if (e.name !== 'AbortError') {
+              ElementPlus.ElMessage.error('请求失败：' + (e.message || '未知错误'));
+            }
+          } finally {
+            loading.value = false;
+            abortController = null;
+          }
+        }
+
+        function handleSSE(event, payload) {
+          if (event === 'thinking') {
+            thinking.value += payload;
+            nextTickScroll();
+          } else if (event === 'done') {
+            domains.value = payload || [];
+            if (domains.value.length === 0) {
+              ElementPlus.ElMessage.warning('返回结果为空，可能解析失败');
+            } else {
+              ElementPlus.ElMessage.success(`成功生成 ${domains.value.length} 个域名`);
+            }
+          } else if (event === 'error') {
+            ElementPlus.ElMessage.error(payload);
+          }
+        }
+
+        function nextTickScroll() {
+          // 用 nextTick 保证 DOM 更新后再滚动，避免竞态
+          nextTick(() => {
+            const el = document.querySelector('.thinking-body');
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        }
+
+        return { form, domains, loading, thinking, thinkingExpanded, handleGenerate };
+      }
+    }).use(ElementPlus).mount('#app');
+  </script>
+</body>
+</html>
