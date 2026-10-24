@@ -25,12 +25,13 @@ export async function generateDomain(theme, desc) {
  * @param {(domains: Array) => void} callbacks.onDone - 最终域名列表回调
  * @param {(msg: string) => void} callbacks.onError - 错误回调
  * @param {AbortSignal} signal - 取消信号
+ * @param {Array<string>} exclude - 需要避开的不可用域名列表
  */
-export async function generateDomainStream(theme, desc, callbacks, signal) {
+export async function generateDomainStream(theme, desc, callbacks, signal, exclude = []) {
   const resp = await fetch(`${baseURL}/generate/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ theme, desc }),
+    body: JSON.stringify({ theme, desc, exclude }),
     signal,
   })
 
@@ -85,9 +86,9 @@ export async function generateDomainStream(theme, desc, callbacks, signal) {
 /**
  * 域名可注册性检测（Cloudflare）
  */
-export async function checkDomains(domains) {
+export async function checkDomains(domains, signal) {
   console.log('[checkDomains] 发起请求，域名列表：', domains)
-  const { data } = await request.post('/check-domains', { domains })
+  const { data } = await request.post('/check-domains', { domains }, { signal })
   console.log('[checkDomains] 响应：', data)
   return data
 }
@@ -96,9 +97,45 @@ export async function checkDomains(domains) {
  * 域名合规性及侵权风险检测（GPT-4o-mini）
  * @param {Array} domains - [{domain, reason}, ...]
  */
-export async function checkCompliance(domains) {
+export async function checkCompliance(domains, signal) {
   console.log('[checkCompliance] 发起请求，域名：', domains)
-  const { data } = await request.post('/check-compliance', { domains })
+  const { data } = await request.post('/check-compliance', { domains }, { signal })
   console.log('[checkCompliance] 响应：', data)
+  return data
+}
+
+/**
+ * 域名历史使用痕迹检测
+ * @param {Array<string>} domains - 域名列表
+ * @param {AbortSignal} signal
+ */
+export async function checkHistory(domains, signal) {
+  console.log('[checkHistory] 发起请求，域名：', domains)
+  const { data } = await request.post('/check-history', { domains }, { signal })
+  console.log('[checkHistory] 响应：', data)
+  return data
+}
+
+/**
+ * 获取不可用域名库列表
+ */
+export async function getUnavailableDomains() {
+  const { data } = await request.get('/unavailable-domains')
+  return data
+}
+
+/**
+ * 批量添加域名到不可用域名库
+ */
+export async function addUnavailableDomains(items) {
+  const { data } = await request.post('/unavailable-domains', { items })
+  return data
+}
+
+/**
+ * 从不可用域名库移除单个域名
+ */
+export async function removeUnavailableDomain(domain) {
+  const { data } = await request.delete(`/unavailable-domains/${domain}`)
   return data
 }
