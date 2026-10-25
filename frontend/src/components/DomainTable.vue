@@ -79,6 +79,64 @@
         </el-table-column>
       </el-table-column>
 
+      <el-table-column label="Trustpilot" width="230" align="center">
+        <template #default="{ row }">
+          <div v-if="row.registrable !== true" class="src-empty">—</div>
+          <div v-else-if="!srcOf(row, 'trustpilot')" class="src-empty">
+            {{ historyChecking ? '检测中' : '未检测' }}
+          </div>
+          <div v-else class="src-cell">
+            <div class="src-line">
+              <span class="src-key">网页链接</span>
+              <a
+                v-if="srcOf(row, 'trustpilot').url"
+                :href="srcOf(row, 'trustpilot').url"
+                target="_blank"
+                class="trace-link"
+              >打开 →</a>
+              <span v-else>无</span>
+            </div>
+            <div class="src-line">
+              <span class="src-key">是否冲突</span>
+              <span :class="srcConflictClass(row, 'trustpilot')">{{ srcConflict(row, 'trustpilot') }}</span>
+            </div>
+            <div class="src-line">
+              <span class="src-key">信息</span>
+              <span>{{ srcMessage(row, 'trustpilot') }}</span>
+            </div>
+          </div>
+        </template>
+      </el-table-column>
+
+      <el-table-column label="Gridinsoft" width="230" align="center">
+        <template #default="{ row }">
+          <div v-if="row.registrable !== true" class="src-empty">—</div>
+          <div v-else-if="!srcOf(row, 'gridinsoft')" class="src-empty">
+            {{ historyChecking ? '检测中' : '未检测' }}
+          </div>
+          <div v-else class="src-cell">
+            <div class="src-line">
+              <span class="src-key">网页链接</span>
+              <a
+                v-if="srcOf(row, 'gridinsoft').url"
+                :href="srcOf(row, 'gridinsoft').url"
+                target="_blank"
+                class="trace-link"
+              >打开 →</a>
+              <span v-else>无</span>
+            </div>
+            <div class="src-line">
+              <span class="src-key">是否冲突</span>
+              <span :class="srcConflictClass(row, 'gridinsoft')">{{ srcConflict(row, 'gridinsoft') }}</span>
+            </div>
+            <div class="src-line">
+              <span class="src-key">信息</span>
+              <span>{{ srcMessage(row, 'gridinsoft') }}</span>
+            </div>
+          </div>
+        </template>
+      </el-table-column>
+
       <el-table-column prop="reason" label="生成理由" min-width="200" show-overflow-tooltip />
       <el-table-column label="风险/痕迹说明" min-width="280">
         <template #default="{ row }">
@@ -91,10 +149,10 @@
             </div>
 
             <div v-if="row.ever_used === true" class="history-summary history-used">
-              综合：曾被发现使用痕迹（{{ row.source_count }}/{{ SOURCES.length }} 个源命中），大概率曾被注册过
+              综合：曾被发现使用痕迹（{{ row.source_count }}/{{ ALL_SOURCES.length }} 个源命中），大概率曾被注册过
             </div>
             <div v-else-if="row.ever_used === false" class="history-summary history-clean">
-              综合：{{ SOURCES.length }} 个源均无痕迹，大概率从未被注册使用
+              综合：{{ ALL_SOURCES.length }} 个源均无痕迹，大概率从未被注册使用
             </div>
             <div v-else-if="row.history_status === 'error'" class="history-summary history-error">
               历史痕迹检测失败（网络不可达，非「无痕迹」）
@@ -131,10 +189,20 @@ defineProps({
   historyChecking: { type: Boolean, default: false },
 })
 
-// 痕迹源列表（新增源时只需在这里和 archive.py 的 SOURCE_ORDER 同步）
+// 痕迹源列表（新增源时只需在这里和 sources/base.py 的 SOURCE_ORDER 同步）
+// Trustpilot 单独成列（展示链接/是否冲突/信息三项），不在此列表内
 const SOURCES = [
   { key: 'wayback', label: 'Wayback' },
   { key: 'crt', label: '证书日志' },
+  { key: 'virustotal', label: 'VirusTotal' },
+]
+
+// 全部源（含独立成列的 Trustpilot / Gridinsoft），用于命中统计与明细展示
+const ALL_SOURCES = [
+  { key: 'wayback', label: 'Wayback' },
+  { key: 'crt', label: '证书日志' },
+  { key: 'trustpilot', label: 'Trustpilot' },
+  { key: 'gridinsoft', label: 'Gridinsoft' },
   { key: 'virustotal', label: 'VirusTotal' },
 ]
 
@@ -147,7 +215,7 @@ function srcTag(row, key) {
   if (!s) return { text: '未检测', type: 'info' }
   if (s.status === 'skipped') return { text: '跳过', type: 'info' }
   if (s.status !== 'ok') return { text: '失败', type: 'danger' }
-  if (s.hit) return { text: `有 ${s.count}`, type: 'warning' }
+  if (s.hit) return { text: s.count ? `有 ${s.count}` : '有', type: 'warning' }
   return { text: '无', type: 'success' }
 }
 
@@ -164,7 +232,33 @@ function srcTip(row, key) {
 
 function sourceList(row) {
   if (!row.sources) return []
-  return SOURCES.map((s) => row.sources[s.key]).filter(Boolean)
+  return ALL_SOURCES.map((s) => row.sources[s.key]).filter(Boolean)
+}
+
+// 独立成列的源（Trustpilot / Gridinsoft）三行展示：是否冲突（hit 为 True 即为「是」）
+// 请求不可达/被拦截时显示「失败」，绝不显示「否」——否则会被误读成「确认无冲突」
+function srcConflict(row, key) {
+  const s = srcOf(row, key)
+  if (!s) return '—'
+  if (s.status === 'skipped') return '—'
+  if (s.status !== 'ok') return '失败'
+  return s.hit === true ? '是' : '否'
+}
+
+function srcConflictClass(row, key) {
+  const text = srcConflict(row, key)
+  if (text === '是') return 'src-yes'
+  if (text === '否') return 'src-no'
+  return 'src-na'
+}
+
+// 独立成列的源：信息（message 字段，没有则「无」）
+function srcMessage(row, key) {
+  const s = srcOf(row, key)
+  if (!s) return '无'
+  const msg = s.message || '无'
+  if (s.status !== 'ok' && s.detail) return `${msg}（${s.detail}）`
+  return msg
 }
 
 function hitSources(row) {
@@ -223,6 +317,40 @@ function hasDetail(row) {
   border-top: 1px dashed #e4e7ed;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.src-cell {
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
+}
+
+.src-line {
+  display: flex;
+  gap: 6px;
+}
+
+.src-key {
+  flex: 0 0 56px;
+  color: #909399;
+}
+
+.src-empty {
+  color: #999;
+  font-size: 12px;
+}
+
+.src-yes {
+  color: #f56c6c;
+  font-weight: 600;
+}
+
+.src-no {
+  color: #67c23a;
+}
+
+.src-na {
+  color: #909399;
 }
 
 .history-used {
