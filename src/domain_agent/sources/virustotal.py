@@ -1,6 +1,7 @@
 """源 4：VirusTotal（历史 WHOIS 创建时间 + 历史 DNS 解析）。"""
 
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -13,6 +14,9 @@ VT_TIMEOUT = 20
 # VirusTotal 免费额度为 4 次/分钟，调用间隔不得低于 15 秒
 VT_MIN_INTERVAL = 15
 _vt_state = {"last_call": 0.0}
+# 多个域名会并发进来（archive 用线程池），必须串行排队，
+# 否则两个线程会同时越过间隔，直接吃 429
+_vt_lock = threading.Lock()
 
 # sources/ 的上一级才是 domain_agent/，config.yaml 在那里
 _CONFIG_PATH = os.path.join(
@@ -39,11 +43,16 @@ def get_virustotal_key():
 
 
 def _vt_wait():
-    """遵守 VirusTotal 免费额度（4 次/分钟），保证两次调用间隔 >= 15 秒。"""
-    elapsed = time.time() - _vt_state["last_call"]
-    if elapsed < VT_MIN_INTERVAL:
-        time.sleep(VT_MIN_INTERVAL - elapsed)
-    _vt_state["last_call"] = time.time()
+    """遵守 VirusTotal 免费额度（4 次/分钟），保证两次调用间隔 >= 15 秒。
+
+    用全局锁串行化：并发进来的多个域名会依次排队，每个都睡够间隔，
+    不会出现两个线程同时判定「已经等够了」而双双发请求（→ 429）。
+    """
+    with _vt_lock:
+        elapsed = time.time() - _vt_state["last_call"]
+        if elapsed < VT_MIN_INTERVAL:
+            time.sleep(VT_MIN_INTERVAL - elapsed)
+        _vt_state["last_call"] = time.time()
 
 
 def check_virustotal(name):

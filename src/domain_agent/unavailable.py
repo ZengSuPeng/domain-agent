@@ -173,7 +173,7 @@ def _json_save_domains(domains):
 
 def _json_add_domains(items):
     existing = _json_load_domains()
-    existing_map = {d["domain"]: d for d in existing}
+    existing_map = {d.get("domain"): d for d in existing}
     added = 0
     now = _now_iso()
     for item in items:
@@ -187,7 +187,11 @@ def _json_add_domains(items):
         else:
             existing_map[domain] = {"domain": domain, "reason": reason, "added_at": now}
             added += 1
-    _json_save_domains(list(existing_map.values()))
+
+    # 落盘即按 added_at 倒序（与 PostgreSQL 的 ORDER BY added_at DESC 同序），
+    # 既让文件本身可读，也保证 deepseek._build_payload 截取前 N 个黑名单时
+    # 拿到的是「最近加入」的一批（旧实现追加到末尾，最新的一批恰好被截掉）。
+    _json_save_domains(_json_sort_newest_first(list(existing_map.values())))
     return added
 
 
@@ -196,18 +200,31 @@ def _json_remove_domain(domain):
     existing = _json_load_domains()
     filtered = [d for d in existing if d.get("domain") != domain]
     if len(filtered) < len(existing):
-        _json_save_domains(filtered)
+        _json_save_domains(_json_sort_newest_first(filtered))
         return True
     return False
+
+
+def _json_sort_newest_first(items):
+    """按 added_at 倒序（最新在前），与 PostgreSQL 的 ORDER BY added_at DESC 对齐。
+
+    ISO 时间串字典序即时间序，直接排序即可；sorted 是稳定的，同一时间戳
+    保持原有相对顺序。缺失/非字符串 added_at 的条目排在最后。
+    """
+    def key(d):
+        ts = d.get("added_at")
+        return ts if isinstance(ts, str) else ""
+
+    return sorted(items, key=key, reverse=True)
 
 
 # ============ 对外统一接口 ============
 
 def load_domains():
-    """获取不可用域名列表。"""
+    """获取不可用域名列表（统一按 added_at 倒序，最新在前）。"""
     if _use_pg():
         return _pg_load_domains()
-    return _json_load_domains()
+    return _json_sort_newest_first(_json_load_domains())
 
 
 def add_domains(items):

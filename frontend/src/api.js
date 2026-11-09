@@ -105,7 +105,7 @@ export async function checkCompliance(domains, signal) {
 }
 
 /**
- * 域名历史使用痕迹检测
+ * 域名历史使用痕迹检测（全量，已不推荐：慢源会阻塞整批）
  * @param {Array<string>} domains - 域名列表
  * @param {AbortSignal} signal
  */
@@ -116,11 +116,52 @@ export async function checkHistory(domains, signal) {
   return data
 }
 
+// 每个源对应独立后端端点，前端 Network 面板可直接看到 4 个不同 URL 的请求
+const SOURCE_ENDPOINTS = {
+  wayback: '/check-wayback',
+  virustotal: '/check-virustotal',
+  trustpilot: '/check-trustpilot',
+  gridinsoft: '/check-gridinsoft',
+}
+
+/**
+ * 单源历史痕迹检测：每个源打到独立 URL，慢源只阻塞自己那一列，
+ * 其他源照常返回并即时渲染，不再「一个失败全部卡死」。
+ * @param {Array<string>} domains - 域名列表
+ * @param {string} source - 源名：wayback / trustpilot / gridinsoft / virustotal
+ * @param {AbortSignal} signal
+ */
+export async function checkHistorySource(domains, source, signal) {
+  const path = SOURCE_ENDPOINTS[source]
+  if (!path) throw new Error(`未知的历史检测源: ${source}`)
+  const { data } = await request.post(path, { domains }, { signal, timeout: 150000 })
+  return data
+}
+
+/**
+ * 查询 DeepSeek 账户余额
+ * @param {AbortSignal} [signal] - 取消信号
+ */
+export async function getDeepSeekBalance(signal) {
+  const { data } = await request.get('/deepseek-balance', { signal, timeout: 20000 })
+  return data
+}
+
+/**
+ * 查询 DMXAPI（模型中转平台）账户余额
+ * @param {AbortSignal} [signal] - 取消信号
+ */
+export async function getDmxapiBalance(signal) {
+  const { data } = await request.get('/dmxapi-balance', { signal, timeout: 20000 })
+  return data
+}
+
 /**
  * 获取不可用域名库列表
+ * @param {AbortSignal} [signal] - 取消信号
  */
-export async function getUnavailableDomains() {
-  const { data } = await request.get('/unavailable-domains')
+export async function getUnavailableDomains(signal) {
+  const { data } = await request.get('/unavailable-domains', { signal, timeout: 20000 })
   return data
 }
 

@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -7,11 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from domain_agent.deepseek import generate_domain, generate_domain_stream
+from domain_agent.deepseek import generate_domain, generate_domain_stream, get_balance
 from domain_agent.cloudfare import check_domain_availability
 from domain_agent import gpt
 from domain_agent.archive import check_domains_history
 from domain_agent import unavailable as unavailable_db
+from domain_agent.sources import trustpilot
 
 app = FastAPI()
 
@@ -20,6 +22,14 @@ app = FastAPI()
 async def startup():
     """启动时初始化不可用域名库（PostgreSQL 建表；无 DB 时回退到 JSON）。"""
     unavailable_db.init_db()
+    # 后台预热 Trustpilot 浏览器：先让 AWS WAF 挑战走完、把 token 写进上下文，
+    # 否则服务刚启动后的第一批域名会整批卡在挑战页上。
+    # 放后台线程，不阻塞启动（首次 Chromium 冷启动要几秒）。
+    threading.Thread(
+        target=lambda: print(f"[Trustpilot] {trustpilot.warmup()}"),
+        daemon=True,
+        name="trustpilot-warmup",
+    ).start()
 
 # CORS：允许前端（Vercel 或本地 5173）跨域调用
 ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else [
@@ -97,9 +107,39 @@ async def api_generate_stream(payload: dict):
     )
 
 
+@app.get("/api/deepseek-balance")
+def api_deepseek_balance():
+    """查询 DeepSeek 账户余额（GET https://api.deepseek.com/user/balance）。
+
+    用同步 def：内部是阻塞式 requests，交给线程池，别卡事件循环。
+    失败时 success=False，message 里带原因（未配 Key / Key 无效 / 超时）。
+    """
+    try:
+        return {"success": True, "data": get_balance()}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/dmxapi-balance")
+def api_dmxapi_balance():
+    """查询 DMXAPI（模型中转平台）账户余额。
+
+    合规检测用的 GPT 模型走的这个平台，但余额接口需要「系统访问令牌 + 用户ID」，
+    跟调模型的 sk-... key 不是一回事（见 gpt.get_balance_credentials）。
+    """
+    try:
+        return {"success": True, "data": gpt.get_balance()}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 @app.post("/api/check-domains")
-async def api_check_domains(payload: dict):
-    """域名可注册性检测（Cloudflare Registrar API）。"""
+def api_check_domains(payload: dict):
+    """域名可注册性检测（Cloudflare Registrar API）。
+
+    用同步 def 而非 async def：内部调用阻塞式 requests，放在线程池里执行，
+    避免阻塞事件循环导致其他请求（含分源并行的历史检测）被一起卡死。
+    """
     domains = payload.get("domains", [])
     if not domains:
         return {"success": False, "message": "domains 不能为空"}
@@ -111,7 +151,7 @@ async def api_check_domains(payload: dict):
 
 
 @app.post("/api/check-compliance")
-async def api_check_compliance(payload: dict):
+def api_check_compliance(payload: dict):
     """域名合规性及侵权风险检测（调用 gpt.py）。
 
     每个域名独立 try/except，部分失败不影响其他域名。
@@ -149,10 +189,14 @@ async def api_check_compliance(payload: dict):
 
 
 @app.post("/api/check-history")
-async def api_check_history(payload: dict):
-    """域名历史使用痕迹检测（Wayback + Common Crawl + crt.sh 证书日志）。
+def api_check_history(payload: dict):
+    """域名历史使用痕迹检测（Wayback / Trustpilot / Gridinsoft / VirusTotal）。
 
-    入参 domains: ["xvoma.com", "abc.com", ...]
+    入参：
+      domains: ["xvoma.com", "abc.com", ...]
+      sources: 可选，只检测指定源，如 ["wayback"]。不传则检测全部源
+               （VirusTotal 仅在其余源无命中时才调用，省额度）。
+               前端按源分别发请求：慢源只阻塞自己，不再拖垮整批。
 
     返回 success 语义：
       - 全部成功 → success=True
@@ -162,8 +206,9 @@ async def api_check_history(payload: dict):
     domains = payload.get("domains", [])
     if not domains:
         return {"success": False, "message": "domains 不能为空"}
+    sources = payload.get("sources")
     try:
-        results = check_domains_history(domains)
+        results = check_domains_history(domains, sources=sources)
         failed = [r for r in results if r.get("status") == "error"]
         partial = [r for r in results if r.get("status") == "partial"]
         total = len(results)
@@ -192,6 +237,60 @@ async def api_check_history(payload: dict):
         }
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+
+# ============ 历史痕迹检测·分源独立端点 ============
+# 每个源一个独立 URL 路径：前端 Network 面板可直接看到 4 个请求，
+# 且慢源只阻塞自己，不再拖垮整批。
+def _check_history_single(payload: dict, source: str):
+    domains = payload.get("domains", [])
+    if not domains:
+        return {"success": False, "message": "domains 不能为空"}
+    try:
+        results = check_domains_history(domains, sources=[source])
+        failed = [r for r in results if r.get("status") == "error"]
+        partial = [r for r in results if r.get("status") == "partial"]
+        total = len(results)
+        if total > 0 and len(failed) == total:
+            return {
+                "success": False,
+                "message": f"全部 {total} 个域名 {source} 源检测失败",
+                "data": results,
+            }
+        return {
+            "success": True,
+            "partial": bool(failed or partial),
+            "failed": len(failed),
+            "partial_count": len(partial),
+            "total": total,
+            "data": results,
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/check-wayback")
+def api_check_wayback(payload: dict):
+    """Wayback Machine 历史存档检测（独立端点）。"""
+    return _check_history_single(payload, "wayback")
+
+
+@app.post("/api/check-trustpilot")
+def api_check_trustpilot(payload: dict):
+    """Trustpilot 评价检测（独立端点）。"""
+    return _check_history_single(payload, "trustpilot")
+
+
+@app.post("/api/check-gridinsoft")
+def api_check_gridinsoft(payload: dict):
+    """Gridinsoft 信誉报告检测（独立端点）。"""
+    return _check_history_single(payload, "gridinsoft")
+
+
+@app.post("/api/check-virustotal")
+def api_check_virustotal(payload: dict):
+    """VirusTotal 检测（独立端点；前端仅在其余源无命中时调用以省额度）。"""
+    return _check_history_single(payload, "virustotal")
 
 
 # ============ 不可用域名库 ============

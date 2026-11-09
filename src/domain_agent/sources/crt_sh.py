@@ -1,4 +1,12 @@
-"""源 3：crt.sh（证书透明度日志）。"""
+"""源 3：crt.sh（证书透明度日志）。【已下线，代码保留备用】
+
+下线原因（实测 2026-11）：crt.sh 的进程级限流 15s + 单次超时 20s + 退避 8s，
+最坏路径 ≈ 63s，已经超过 archive.SOURCE_BUDGETS 给它的 60s；批量查 5 个域名
+需要 100s+（每个域名都要等一个 15s 时间槽），实际 4/5 判超时。该源不再注册到
+archive._SOURCE_FUNCS，也不在 sources/__init__.py 中导出。
+若将来要恢复：把 check_crt_sh 接回 _SOURCE_FUNCS，同时把内网参数调到与预算自洽
+（或改成「按剩余预算决定是否重试」）。
+"""
 
 import threading
 import time
@@ -7,13 +15,14 @@ import requests
 
 from .base import HTTP_HEADERS, get_proxies, load_json, source_error, source_ok
 
-CRT_TIMEOUT = 25
+CRT_TIMEOUT = 20
 # crt.sh 稳定性较差（常返回 502/503），且对连续请求敏感：
 # 上一个成功、下一个立刻失败、再下一个又成功，就是典型的高频被拒 + 后端随机过载。
-# 因此拉大「任意两次请求之间」的全局最小间隔，并允许更多次退避重试。
-CRT_MIN_INTERVAL = 20   # 全局最小请求间隔（秒）
-CRT_RETRIES = 3         # 502 多为后端瞬时过载，多次退避重试可显著提高成功率
-CRT_RETRY_BACKOFF = 25  # 失败后的额外等待（秒），叠加限流后约 25~45s 再试
+# 注意：此源已被隔离为「前端独立请求」，并受 archive.SOURCE_BUDGETS["crt"]=60s 整体约束，
+# 到点即返回 error，不会无限重试拖垮整批。这里退避不宜过大，否则单次 502 就要等 45s+。
+CRT_MIN_INTERVAL = 15   # 全局最小请求间隔（秒）
+CRT_RETRIES = 2         # 502 多为瞬时过载，2 次退避重试足够；再多收益低、拖时长
+CRT_RETRY_BACKOFF = 8   # 失败后的额外等待（秒）
 
 # 进程内全局限流：所有线程共用同一个「上次请求时间」，
 # 保证无论并发了多少个域名，crt.sh 都不会被连续敲门。

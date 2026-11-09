@@ -15,14 +15,13 @@ HTTP_HEADERS = {
 # 各痕迹源的展示名称
 SOURCE_LABELS = {
     "wayback": "Wayback Machine",
-    "crt": "证书日志 crt.sh",
     "trustpilot": "Trustpilot 评价",
     "gridinsoft": "Gridinsoft 信誉报告",
     "virustotal": "VirusTotal",
 }
 
 # 源顺序（前端展示顺序）
-SOURCE_ORDER = ["wayback", "crt", "trustpilot", "gridinsoft", "virustotal"]
+SOURCE_ORDER = ["wayback", "trustpilot", "gridinsoft", "virustotal"]
 
 # 各源统一的结果结构：
 # {
@@ -67,7 +66,7 @@ def format_timestamp(ts):
 
 
 def load_json(resp):
-    """安全解析 JSON；crt.sh 等不稳定服务出错时会返回 HTML，此时返回 None。"""
+    """安全解析 JSON；服务过载时可能返回 HTML 错误页，此时返回 None。"""
     try:
         return resp.json()
     except ValueError:

@@ -1,6 +1,6 @@
 <template>
   <div class="result-table">
-    <el-table :data="domains" border stripe v-loading="checking || complianceChecking || historyChecking">
+    <el-table :data="domains" border stripe v-loading="checking || complianceChecking">
       <el-table-column type="index" label="#" width="55" align="center" />
       <el-table-column prop="domain" label="域名" width="150" align="center">
         <template #default="{ row }">
@@ -149,10 +149,10 @@
             </div>
 
             <div v-if="row.ever_used === true" class="history-summary history-used">
-              综合：曾被发现使用痕迹（{{ row.source_count }}/{{ ALL_SOURCES.length }} 个源命中），大概率曾被注册过
+              综合：曾被发现使用痕迹（{{ row.source_count }}/{{ row.ok_count ?? ALL_SOURCES.length }} 个源命中），大概率曾被注册过
             </div>
             <div v-else-if="row.ever_used === false" class="history-summary history-clean">
-              综合：{{ ALL_SOURCES.length }} 个源均无痕迹，大概率从未被注册使用
+              综合：{{ row.ok_count ?? ALL_SOURCES.length }} 个源均无痕迹，大概率从未被注册使用
             </div>
             <div v-else-if="row.history_status === 'error'" class="history-summary history-error">
               历史痕迹检测失败（网络不可达，非「无痕迹」）
@@ -193,14 +193,12 @@ defineProps({
 // Trustpilot 单独成列（展示链接/是否冲突/信息三项），不在此列表内
 const SOURCES = [
   { key: 'wayback', label: 'Wayback' },
-  { key: 'crt', label: '证书日志' },
   { key: 'virustotal', label: 'VirusTotal' },
 ]
 
 // 全部源（含独立成列的 Trustpilot / Gridinsoft），用于命中统计与明细展示
 const ALL_SOURCES = [
   { key: 'wayback', label: 'Wayback' },
-  { key: 'crt', label: '证书日志' },
   { key: 'trustpilot', label: 'Trustpilot' },
   { key: 'gridinsoft', label: 'Gridinsoft' },
   { key: 'virustotal', label: 'VirusTotal' },

@@ -19,6 +19,8 @@ import requests
 import yaml
 
 API_URL = "https://api.deepseek.com/chat/completions"
+BALANCE_URL = "https://api.deepseek.com/user/balance"
+BALANCE_TIMEOUT = 15
 MODEL = "deepseek-flash"
 
 # 思考模式：官方默认开启，effort 默认 high
@@ -66,13 +68,20 @@ def _build_payload(theme, desc, exclude=None):
     # 构建黑名单提示（仅在有黑名单时附加）
     blacklist_hint = ""
     if exclude:
-        # 最多展示 50 个，避免 prompt 过长
-        shown = exclude[:50]
+        # exclude 由 unavailable.load_domains() 保证「最新在前」，
+        # 因此截断取前 50 个 = 取最近加入的 50 个（旧实现依赖追加顺序，
+        # JSON 存储模式下最新的一批会被截在门外）。
+        shown = list(exclude)[:50]
+        truncated_hint = (
+            f"\n（以上为最近 {len(shown)} 个，另有 {len(exclude) - len(shown)} 个较早的未列出）\n"
+            if len(exclude) > len(shown)
+            else "\n"
+        )
         blacklist_hint = (
             "\n以下域名已被确认不可用（已注册/侵权风险高/曾被使用过），"
             "请绝对不要生成相同或高度相似的域名：\n"
-            + ", ".join(shown)
-            + ("\n" if len(exclude) > 50 else "")
+            + ", ".join(str(d) for d in shown)
+            + truncated_hint
         )
 
     payload = {
@@ -109,7 +118,8 @@ def generate_domain_stream(theme, desc, exclude=None):
       - {"type": "done", "domains": [...]}         最终域名列表
       - {"type": "error", "message": "..."}        出错
 
-    :param exclude: 需避开的不可用域名列表
+    :param exclude: 需避开的不可用域名列表（调用方应按「最新在前」传入，
+                    _build_payload 只取前 50 个以控制 prompt 长度）
     """
     try:
         api_key = get_api_key()
@@ -228,3 +238,69 @@ def generate_domain(theme, desc, exclude=None):
         elif event["type"] == "error":
             return {"domains": [], "thinking": "".join(thinking_parts), "error": event["message"]}
     return {"domains": domains, "thinking": "".join(thinking_parts)}
+
+
+def get_balance():
+    """查询 DeepSeek 账户余额（GET /user/balance）。
+
+    官方返回：
+      {"is_available": true,
+       "balance_infos": [{"currency": "CNY", "total_balance": "110.00",
+                          "granted_balance": "10.00", "topped_up_balance": "100.00"}]}
+    注意 total/granted/topped_up 都是字符串，这里保持原样（避免浮点误差），
+    另补一个 float 版 total_value 供前端做阈值判断。
+
+    :return: dict —— {"is_available": bool, "balances": [...], "fetched_at": str}
+    :raises RuntimeError: 未配置 Key / Key 无效 / 接口异常
+    """
+    api_key = get_api_key()
+    try:
+        resp = requests.get(
+            BALANCE_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+            timeout=BALANCE_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"DeepSeek 余额查询超时（{BALANCE_TIMEOUT}s）")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"DeepSeek 余额查询失败: {type(e).__name__}")
+
+    if resp.status_code == 401:
+        raise RuntimeError("DeepSeek API Key 无效（401）")
+    if resp.status_code != 200:
+        raise RuntimeError(f"DeepSeek 返回 HTTP {resp.status_code}：{resp.text[:120]}")
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError("DeepSeek 返回内容不是有效 JSON")
+
+    raw_infos = payload.get("balance_infos")
+    if not isinstance(raw_infos, list):
+        raise RuntimeError("DeepSeek 返回格式异常（缺少 balance_infos）")
+
+    balances = []
+    for item in raw_infos:
+        if not isinstance(item, dict):
+            continue
+        total = item.get("total_balance")
+        try:
+            total_value = float(total)
+        except (TypeError, ValueError):
+            total_value = None
+        balances.append({
+            "currency": item.get("currency") or "",
+            "total": total,
+            "granted": item.get("granted_balance"),
+            "topped_up": item.get("topped_up_balance"),
+            "total_value": total_value,
+        })
+
+    return {
+        "is_available": bool(payload.get("is_available")),
+        "balances": balances,
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }

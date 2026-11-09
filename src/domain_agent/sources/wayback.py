@@ -40,10 +40,16 @@ def _error_result(name, detail):
     }
 
 
-def _check_via_cdx(name):
-    """通过 CDX API 查询存档（信息完整，但热门域名可能超时）。
+def _fetch_cdx(name, match_type):
+    """查一次 CDX，返回时间戳列表；接口非 200 返回 None（触发降级）。
 
-    :return: 结果 dict；若接口返回非 200 则返回 None（触发降级）
+    不传 collapse=timestamp:4：它让服务端先按年聚合再裁剪，和 matchType=domain
+    （扫全部子域名）组合时实测同一次查询从 7s 涨到 31s，而绝大多数候选域名
+    本来就查不到，等于每个都白付 30 秒。年份去重放到客户端做（见
+    _result_from_timestamps）。代价：对存档成千上万的热门域名，limit=100 只取
+    到最早的 100 条，「最近存档时间」可能偏小——但 hit（有/无存档）不受影响。
+
+    :return: [] 表示确认无存档；None 表示接口异常、无法判断
     """
     url = "http://web.archive.org/cdx/search/cdx"
     params = {
@@ -51,7 +57,7 @@ def _check_via_cdx(name):
         "output": "json",
         "limit": 100,
         "fl": "timestamp",
-        "collapse": "timestamp:4",  # 同一年只取一条
+        "matchType": match_type,
     }
     resp = requests.get(
         url, params=params, timeout=CDX_TIMEOUT, proxies=get_proxies()
@@ -61,18 +67,21 @@ def _check_via_cdx(name):
 
     data = resp.json()
     if not isinstance(data, list) or len(data) <= 1:
-        return _no_archive_result(name)
+        return []
+    return [s[0] for s in data[1:] if len(s) >= 1 and s[0]]
 
-    snapshots = data[1:]
-    timestamps = [s[0] for s in snapshots if len(s) >= 1 and s[0]]
 
+def _result_from_timestamps(name, timestamps, include_sub=False):
+    """把 CDX 时间戳列表整理成结果 dict。"""
     if not timestamps:
         return _no_archive_result(name)
 
-    year_count = len(timestamps)
+    # 服务端不再按年 collapse，这里自己去重（同一年多条只算一年）
+    year_count = len({ts[:4] for ts in timestamps if len(ts) >= 4}) or len(timestamps)
     earliest = min(timestamps)
     latest = max(timestamps)
     archive_url = f"https://web.archive.org/web/*/{name}"
+    suffix = "（含子域名存档）" if include_sub else ""
 
     return {
         "domain": name,
@@ -83,11 +92,33 @@ def _check_via_cdx(name):
         "latest_date": format_timestamp(latest),
         "archive_url": archive_url,
         "message": (
-            f"该域名在 {year_count} 个年份中有历史存档，"
+            f"该域名在 {year_count} 个年份中有历史存档{suffix}，"
             f"最早 {format_timestamp(earliest)}，"
             f"最近 {format_timestamp(latest)}"
         ),
     }
+
+
+def _check_via_cdx(name):
+    """通过 CDX API 查询存档（信息完整，但热门域名可能超时）。
+
+    先用 matchType=exact 精确匹配裸主机名（更快），查不到再退到 matchType=domain。
+    只查 exact 会误判：多数站点的存档挂在 "example.com/"、"www.example.com" 之下，
+    裸主机名精确匹配为空，会被当成「从未被用于建站」。
+
+    :return: 结果 dict；若接口返回非 200 则返回 None（触发降级）
+    """
+    timestamps = _fetch_cdx(name, "exact")
+    if timestamps is None:
+        return None
+
+    if not timestamps:
+        wider = _fetch_cdx(name, "domain")
+        if wider is None:
+            return None
+        return _result_from_timestamps(name, wider, include_sub=True)
+
+    return _result_from_timestamps(name, timestamps)
 
 
 def _check_via_availability(name):

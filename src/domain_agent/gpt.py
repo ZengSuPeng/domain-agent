@@ -1,7 +1,21 @@
 import json
 import os
 import time
+
 import requests
+import yaml
+
+# ============ DMXAPI 余额（平台管理接口） ============
+# 文档：https://doc.dmxapi.cn/yuer.html
+#   GET https://www.dmxapi.cn/api/user/self
+#   Authorization: Bearer <系统访问令牌>    ← 不是调模型用的 sk-... key
+#   Dmx-Api-User: <用户ID>
+#   人民币余额 = data.quota / 500000
+DMX_BASE = "https://www.dmxapi.cn"
+DMX_SELF_URL = f"{DMX_BASE}/api/user/self"
+DMX_QUOTA_PER_CNY = 500000
+DMX_TIMEOUT = 20
+DMX_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 
 
 def main(args, domain_data):
@@ -24,6 +38,94 @@ def get_api_key():
         raise RuntimeError(
             "未找到 GPT API Key：请设置环境变量 GPT_API_KEY，或在 D:\\API CONFIG.txt 放置密钥"
         )
+
+
+def get_balance_credentials():
+    """读取 DMXAPI 平台管理接口所需的 (系统令牌, 用户ID)。
+
+    这两个值跟调模型用的 sk-... key 不是一回事：
+      环境变量 DMXAPI_SYSTEM_TOKEN / DMXAPI_USER_ID
+      或 config.yaml 的 keys.dmxapi_system_token / keys.dmxapi_user_id
+    获取方式：https://www.dmxapi.cn/profile（安全与访问 → 访问令牌；个人资料 → 用户 ID）
+    """
+    token = (os.environ.get("DMXAPI_SYSTEM_TOKEN") or "").strip()
+    user_id = (os.environ.get("DMXAPI_USER_ID") or "").strip()
+    if token and user_id:
+        return token, user_id
+
+    try:
+        with open(DMX_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (FileNotFoundError, OSError):
+        data = {}
+
+    keys = data.get("keys") if isinstance(data, dict) else None
+    if isinstance(keys, dict):
+        token = token or str(keys.get("dmxapi_system_token") or "").strip()
+        user_id = user_id or str(keys.get("dmxapi_user_id") or "").strip()
+    return token, user_id
+
+
+def get_balance():
+    """查询 DMXAPI 账户余额（平台管理接口 /api/user/self）。
+
+    :return: dict —— {"quota": int, "balance_cny": float, "used_cny": float|None,
+                      "username": str, "fetched_at": str}
+    :raises RuntimeError: 未配置系统令牌 / 令牌无效 / 接口异常
+    """
+    token, user_id = get_balance_credentials()
+    if not token or not user_id:
+        raise RuntimeError(
+            "未配置系统访问令牌/用户ID（需要 DMXAPI_SYSTEM_TOKEN + DMXAPI_USER_ID，"
+            "不是调模型的 sk-... key；到 https://www.dmxapi.cn/profile 获取）"
+        )
+
+    try:
+        resp = requests.get(
+            DMX_SELF_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Dmx-Api-User": user_id,
+                "Accept": "application/json",
+            },
+            timeout=DMX_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"DMXAPI 余额查询超时（{DMX_TIMEOUT}s）")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"DMXAPI 余额查询失败: {type(e).__name__}")
+
+    if resp.status_code == 401:
+        raise RuntimeError("DMXAPI 系统令牌无效或已过期（401）")
+    if resp.status_code != 200:
+        raise RuntimeError(f"DMXAPI 返回 HTTP {resp.status_code}：{resp.text[:120]}")
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError("DMXAPI 返回内容不是有效 JSON")
+
+    if not isinstance(payload, dict) or not payload.get("success"):
+        msg = payload.get("message") if isinstance(payload, dict) else ""
+        raise RuntimeError(f"DMXAPI 获取用户信息失败：{msg or '未知原因'}")
+
+    data = payload.get("data") or {}
+    quota = data.get("quota")
+    used = data.get("used_quota")
+
+    def to_cny(value):
+        try:
+            return round(float(value) / DMX_QUOTA_PER_CNY, 4)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "quota": quota,
+        "balance_cny": to_cny(quota),
+        "used_cny": to_cny(used),
+        "username": data.get("username") or data.get("display_name") or "",
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
 
 
 def _do_request(url, headers, payload, timeout=60, max_retries=2):

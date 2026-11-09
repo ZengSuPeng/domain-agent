@@ -18,6 +18,7 @@ cloud fare config.txt
 .env
 .env.local
 .env.production.local
+.env.localdev
 
 # 运行时数据
 src/domain_agent/unavailable_domains.json
@@ -25,6 +26,7 @@ src/domain_agent/unavailable_domains.json
 # 测试脚本
 src/domain_agent/test_common_crawl.py
 test_archive.py
+_e2e_client.py
 
 # 本地 Node 安装目录
 node/
