@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { getToken, clearSession } from './auth'
 
 // 生产环境用环境变量指定后端地址，开发环境走 Vite 代理 (/api -> 127.0.0.1:8001)
 const baseURL = import.meta.env.VITE_API_BASE_URL || '/api'
@@ -7,6 +8,28 @@ const request = axios.create({
   baseURL,
   timeout: 300000,
 })
+
+// 每个请求都带上飞书登录后拿到的 session token
+request.interceptors.request.use((config) => {
+  const token = getToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+// 登录态过期时清掉本地缓存，通知 App 回到登录页；
+// 其他错误原样抛给调用方（各业务函数自己处理提示）
+request.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      clearSession()
+      window.dispatchEvent(new CustomEvent('auth:expired'))
+    }
+    return Promise.reject(error)
+  }
+)
 
 /**
  * 非流式生成域名（已废弃，推荐用 generateDomainStream）
@@ -28,12 +51,23 @@ export async function generateDomain(theme, desc) {
  * @param {Array<string>} exclude - 需要避开的不可用域名列表
  */
 export async function generateDomainStream(theme, desc, callbacks, signal, exclude = []) {
+  const token = getToken()
   const resp = await fetch(`${baseURL}/generate/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({ theme, desc, exclude }),
     signal,
   })
+
+  if (resp.status === 401) {
+    clearSession()
+    window.dispatchEvent(new CustomEvent('auth:expired'))
+    callbacks.onError?.('登录已过期，请重新登录')
+    return
+  }
 
   if (!resp.ok) {
     callbacks.onError?.(`HTTP ${resp.status}`)

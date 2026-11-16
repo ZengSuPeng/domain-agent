@@ -1,19 +1,57 @@
 import json
 import os
+import re
 import threading
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
+from domain_agent import auth
 from domain_agent.deepseek import generate_domain, generate_domain_stream, get_balance
 from domain_agent.cloudfare import check_domain_availability
 from domain_agent import gpt
 from domain_agent.archive import check_domains_history
 from domain_agent import unavailable as unavailable_db
 from domain_agent.sources import trustpilot
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# .env 行格式：KEY=VALUE，也兼容 KEY: VALUE 和 export KEY=VALUE
+_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.*?)\s*$")
+
+
+def _load_dotenv():
+    """读取项目根目录的 .env（本地开发用；Render 上直接配环境变量即可）。
+
+    只补缺失的键，不覆盖已存在的环境变量，所以生产环境变量永远优先。
+    兼容 `KEY=VALUE` / `KEY: VALUE`（冒号便于直接照抄飞书文档）/
+    `export KEY=VALUE` 三种写法，并用 utf-8-sig 兼容记事本保存的 BOM。
+    """
+    env_file = BASE_DIR / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv()
 
 app = FastAPI()
 
@@ -22,6 +60,15 @@ app = FastAPI()
 async def startup():
     """启动时初始化不可用域名库（PostgreSQL 建表；无 DB 时回退到 JSON）。"""
     unavailable_db.init_db()
+    st = auth.status()
+    if st["enabled"]:
+        print(
+            "[auth] 飞书登录已启用"
+            f"（configured={st['configured']}, allowlist={st['allowlist_configured']}）"
+        )
+    else:
+        print(f"[auth] 未启用登录校验：{st['reason'] or '未配置 FEISHU_APP_ID / FEISHU_APP_SECRET'}")
+    print(f"[cors] 允许的前端 Origin：{', '.join(ALLOWED_ORIGINS)}")
     # 后台预热 Trustpilot 浏览器：先让 AWS WAF 挑战走完、把 token 写进上下文，
     # 否则服务刚启动后的第一批域名会整批卡在挑战页上。
     # 放后台线程，不阻塞启动（首次 Chromium 冷启动要几秒）。
@@ -31,11 +78,51 @@ async def startup():
         name="trustpilot-warmup",
     ).start()
 
-# CORS：允许前端（Vercel 或本地 5173）跨域调用
-ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+# CORS：允许前端（Cloudflare Pages 或本地 5173）跨域调用
+# 统一做去空格/去尾部斜杠，避免 Render 面板里手写 "https://x.pages.dev, https://y" 时匹配失败
+_raw_origins = (os.environ.get("CORS_ORIGINS") or "").strip()
+ALLOWED_ORIGINS = (
+    [item.strip().rstrip("/") for item in _raw_origins.split(",") if item.strip()]
+    if _raw_origins
+    else ["http://localhost:5173", "http://127.0.0.1:5173"]
+)
+
+
+@app.middleware("http")
+async def feishu_auth_guard(request: Request, call_next):
+    """登录校验：未登录一律拒绝 /api/* 请求（登录流程端点除外）。
+
+    中间件顺序有讲究：Starlette 的 add_middleware 是「后加的更靠外层」，
+    所以本中间件必须先于 CORSMiddleware 注册（CORS 在文件下方 add），
+    这样 CORS 包在最外层——401/503 响应同样带 CORS 头，跨域前端才能
+    读到状态码并触发「登录过期」逻辑，而不是被浏览器当成网络错误。
+    """
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/"):
+        return await call_next(request)
+    # 登录流程本身不需要登录态（容忍末尾多余斜杠）
+    if (path.rstrip("/") or "/") in auth.PUBLIC_API_PATHS:
+        return await call_next(request)
+
+    st = auth.status()
+    if not st["enabled"]:
+        return await call_next(request)
+    if not st["configured"]:
+        return JSONResponse(
+            {"success": False, "code": "auth_misconfigured", "message": st["reason"]},
+            status_code=503,
+        )
+    user = auth.user_from_request(request)
+    if not user:
+        return JSONResponse(
+            {"success": False, "code": "unauthorized", "message": "未登录或登录已过期"},
+            status_code=401,
+        )
+    request.state.user = user
+    return await call_next(request)
+
+
+# 注意：必须在上面注册完鉴权中间件后再 add_middleware(CORS)，否则 CORS 会被包在内层
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -44,7 +131,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 
 
@@ -63,6 +150,130 @@ async def index(request: Request):
         "<h1>Backend is running</h1>"
         "<p>前端未构建，请在 <code>frontend/</code> 目录下执行 <code>npm run build</code>。</p>"
     )
+
+
+# ============ 飞书登录 ============
+# 说明：真实登录走浏览器整页跳转（飞书授权页自带扫码/账密登录），
+# 后端只负责签发/校验登录态，不接触用户密码。
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    """查询当前登录态；未启用登录时返回一个本地用户，前端直接进主界面。"""
+    st = auth.status()
+    if not st["enabled"]:
+        return {
+            "success": True,
+            "authenticated": True,
+            "auth_enabled": False,
+            "feishu_configured": False,
+            "user": {"name": "本地开发", "email": "", "avatar": "", "open_id": ""},
+            "message": st["reason"],
+        }
+
+    user = auth.user_from_request(request)
+    if not user:
+        return {
+            "success": True,
+            "authenticated": False,
+            "auth_enabled": True,
+            "feishu_configured": st["configured"],
+            "allowlist_configured": st["allowlist_configured"],
+            "message": st["reason"],
+        }
+
+    return {
+        "success": True,
+        "authenticated": True,
+        "auth_enabled": True,
+        "feishu_configured": True,
+        "user": auth.public_user(user),
+        "expires_at": user.get("exp"),
+    }
+
+
+@app.get("/api/auth/feishu/url")
+def api_feishu_login_url(request: Request, redirect: str = ""):
+    """生成飞书授权页地址（前端拿到后整页跳转过去）。"""
+    st = auth.status()
+    if not st["enabled"]:
+        return {"success": False, "message": "飞书登录未启用"}
+    if not st["configured"]:
+        return {"success": False, "message": st["reason"] or "飞书登录未配置"}
+
+    # 只接受白名单 origin，防开放重定向；非法/缺省时回退到默认前端地址
+    target = auth.safe_redirect(request, redirect) or auth.default_frontend(request)
+    redirect_url = auth.redirect_uri(request)
+    state = auth.new_state(target)
+    return {
+        "success": True,
+        "data": {
+            "url": auth.build_authorize_url(state, redirect_url),
+            "redirect_uri": redirect_url,
+        },
+    }
+
+
+@app.get("/api/auth/feishu/callback")
+def api_feishu_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """飞书授权回调：code 换用户信息 -> 签一次性 ticket -> 跳回前端。"""
+    # state 已签名，能还原出登录成功后的前端回跳地址；再校验一次 origin 防篡改
+    target = (
+        auth.safe_redirect(request, auth.validate_state(state) or "")
+        or auth.default_frontend(request)
+    )
+
+    if error:
+        message = (
+            "已取消飞书授权"
+            if error in ("access_denied", "user_cancelled")
+            else f"飞书授权失败：{error}"
+        )
+        return RedirectResponse(auth.append_query(target, login_error=message))
+
+    st = auth.status()
+    if not st["enabled"]:
+        return RedirectResponse(auth.append_query(target, login_error="飞书登录未启用"))
+    if not st["configured"]:
+        return RedirectResponse(
+            auth.append_query(target, login_error=st["reason"] or "飞书登录未配置")
+        )
+    if not code:
+        return RedirectResponse(auth.append_query(target, login_error="飞书未返回授权码，请重新登录"))
+
+    try:
+        user = auth.login(code, auth.redirect_uri(request))
+        allowed, reason = auth.check_allowlist(user)
+        if not allowed:
+            print(f"[auth] 拒绝登录：{reason}")
+            return RedirectResponse(auth.append_query(target, login_error=reason))
+        ticket = auth.issue_ticket(user)
+        print(f"[auth] 登录成功：{user.get('name')}（{user.get('email') or user.get('open_id')}）")
+    except auth.AuthError as exc:
+        print(f"[auth] 登录失败：{exc}")
+        return RedirectResponse(auth.append_query(target, login_error=str(exc)))
+    except Exception as exc:  # noqa: BLE001 - 回调页必须给出可读反馈，不能 500
+        print(f"[auth] 登录回调异常：{exc}")
+        return RedirectResponse(auth.append_query(target, login_error="登录失败，请稍后重试"))
+
+    return RedirectResponse(auth.append_query(target, ticket=ticket))
+
+
+@app.post("/api/auth/feishu/exchange")
+async def api_feishu_exchange(payload: dict):
+    """用一次性 ticket 换正式 session token。"""
+    ticket = str(payload.get("ticket") or "")
+    user = auth.consume_ticket(ticket)
+    if not user:
+        return {"success": False, "message": "登录凭证无效或已过期，请重新登录"}
+    return {"success": True, "data": auth.issue_session(user)}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    """退出登录。登录态是无状态签名 token，前端丢弃即可。
+
+    保留这个端点是为了以后加服务端吊销/审计时前端不用改。
+    """
+    return {"success": True}
 
 
 # ============ API ============

@@ -1,5 +1,22 @@
 <template>
-  <el-container class="layout">
+  <div v-if="!authReady" class="auth-boot">
+    <div class="auth-boot-card">
+      <span class="auth-boot-logo">🌐</span>
+      <div class="auth-boot-title">汉盈域名检测</div>
+      <div class="auth-boot-tip">正在连接服务…（首次访问需唤醒后端，约 30~60 秒）</div>
+    </div>
+  </div>
+
+  <LoginPage
+    v-else-if="!user"
+    :error="loginError"
+    :loading="loginLoading"
+    :configured="feishuConfigured"
+    @login="handleLogin"
+    @retry="handleRetry"
+  />
+
+  <el-container v-else class="layout">
     <el-aside width="208px" class="sidebar">
       <div class="brand">
         <span class="brand-logo">🌐</span>
@@ -20,21 +37,44 @@
       <el-header class="topbar">
         <div class="app-header">
           <div class="app-title">{{ pageTitle }}</div>
-          <div class="balance-box">
-            <el-tooltip
-              v-for="c in balanceCards"
-              :key="c.key"
-              :content="c.tip"
-              placement="bottom"
-              :disabled="!c.tip"
-            >
-              <span class="balance-text" :class="{ 'balance-low': c.low, 'balance-err': c.err }">
-                {{ c.text }}
+          <div class="topbar-right">
+            <div class="balance-box">
+              <el-tooltip
+                v-for="c in balanceCards"
+                :key="c.key"
+                :content="c.tip"
+                placement="bottom"
+                :disabled="!c.tip"
+              >
+                <span class="balance-text" :class="{ 'balance-low': c.low, 'balance-err': c.err }">
+                  {{ c.text }}
+                </span>
+              </el-tooltip>
+              <el-button link size="small" :loading="anyBalanceLoading" @click="loadBalances()">
+                刷新
+              </el-button>
+            </div>
+
+            <el-dropdown v-if="authEnabled" trigger="click" @command="onUserCommand">
+              <span class="user-chip">
+                <el-avatar :size="26" :src="user.avatar || undefined" class="user-avatar">
+                  {{ avatarText }}
+                </el-avatar>
+                <span class="user-name">{{ user.name || user.email || '飞书用户' }}</span>
+                <span class="user-caret" aria-hidden="true">▾</span>
               </span>
-            </el-tooltip>
-            <el-button link size="small" :loading="anyBalanceLoading" @click="loadBalances()">
-              刷新
-            </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item v-if="user.email" disabled>{{ user.email }}</el-dropdown-item>
+                  <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+
+            <span v-else class="user-chip" title="未配置飞书登录，当前为本地调试模式">
+              <el-avatar :size="26" class="user-avatar">{{ avatarText }}</el-avatar>
+              <span class="user-name">本地调试</span>
+            </span>
           </div>
         </div>
       </el-header>
@@ -76,12 +116,23 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import DomainForm from './components/DomainForm.vue'
 import ThinkingBox from './components/ThinkingBox.vue'
 import DomainTable from './components/DomainTable.vue'
 import UnavailableDomains from './components/UnavailableDomains.vue'
+import LoginPage from './components/LoginPage.vue'
+import {
+  authEnabled,
+  currentUser,
+  exchangeTicket,
+  fetchMe,
+  feishuConfigured,
+  getFeishuLoginUrl,
+  hasStoredSession,
+  logout as logoutAuth,
+} from './auth'
 import {
   generateDomainStream,
   checkDomains,
@@ -92,6 +143,18 @@ import {
   getDeepSeekBalance,
   getDmxapiBalance,
 } from './api'
+
+// ============ 飞书登录态 ============
+const user = currentUser
+const authReady = ref(false)
+const loginLoading = ref(false)
+const loginError = ref('')
+let initialDataLoaded = false
+
+const avatarText = computed(() => {
+  const name = (user.value?.name || user.value?.email || '飞').trim()
+  return name.slice(0, 1).toUpperCase()
+})
 
 const loading = ref(false)
 const checking = ref(false)
@@ -237,13 +300,133 @@ async function loadUnavailableDomains(signal) {
   }
 }
 
-// 挂载即拉一次：既预热黑名单，也让 Render 免费实例的冷启动在用户填表单时就开始唤醒，
-// 而不是等用户点了「生成」才开始等 30~60s 的唤醒。
-onMounted(() => {
+// ============ 登录流程 ============
+// 挂载时先确定登录态：
+//   1) URL 带 ticket（从飞书回调跳回）→ 先换 session token；
+//   2) 本地已有登录态 → 立刻渲染主界面，后台静默复核（Render 冷启动不至于白屏）；
+//   3) 其它情况 → 查 /api/auth/me，没启用登录就按本地模式直接进。
+onMounted(async () => {
+  window.addEventListener('auth:expired', onAuthExpired)
+  await bootstrapAuth()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('auth:expired', onAuthExpired)
+})
+
+async function bootstrapAuth() {
+  const url = new URL(window.location.href)
+  const ticket = url.searchParams.get('ticket')
+  const loginErrorParam = url.searchParams.get('login_error')
+
+  // ticket / 错误信息只用于本次登录，读完立刻从地址栏抹掉，避免留在历史记录里
+  if (ticket || loginErrorParam) {
+    window.history.replaceState({}, '', url.pathname + url.hash)
+  }
+  if (loginErrorParam) loginError.value = loginErrorParam
+
+  if (ticket) {
+    try {
+      const res = await exchangeTicket(ticket)
+      if (!res.success) loginError.value = res.message || '登录失败，请重新登录'
+    } catch (e) {
+      loginError.value = '登录失败：' + (e.message || '网络异常')
+    }
+    authReady.value = true
+    if (user.value) loadInitialData()
+    return
+  }
+
+  if (hasStoredSession()) {
+    authReady.value = true
+    loadInitialData()
+    validateSession()
+    return
+  }
+
+  await detectSession()
+}
+
+async function detectSession() {
+  try {
+    const me = await fetchMe()
+    if (me && me.authenticated === false && me.feishu_configured === false && me.message) {
+      loginError.value = me.message
+    }
+  } catch (e) {
+    loginError.value =
+      e.code === 'ECONNABORTED'
+        ? '后端服务响应超时（Render 冷启动中），请点击下方“重试”。'
+        : '无法连接后端服务：' + (e.message || '网络异常，请稍后重试')
+  } finally {
+    authReady.value = true
+    if (user.value) loadInitialData()
+  }
+}
+
+// 有本地登录态时后台复核；网络失败（如 Render 冷启动）先保留，等业务请求 401 再处理
+async function validateSession() {
+  try {
+    const me = await fetchMe()
+    if (me && me.authenticated === false) {
+      loginError.value = '登录已过期，请重新登录'
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function onAuthExpired() {
+  loginError.value = '登录已过期，请重新登录'
+}
+
+async function handleLogin() {
+  loginLoading.value = true
+  loginError.value = ''
+  try {
+    const url = await getFeishuLoginUrl()
+    window.location.assign(url)
+  } catch (e) {
+    loginError.value = e.message || '获取飞书登录地址失败'
+    loginLoading.value = false
+  }
+}
+
+async function handleRetry() {
+  loginError.value = ''
+  authReady.value = false
+  await detectSession()
+}
+
+async function handleLogout() {
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+  }
+  await logoutAuth()
+  domains.value = []
+  thinking.value = ''
+  progressText.value = ''
+  unavailableDomains.value = []
+  blacklistPromise = null
+  initialDataLoaded = false
+  loginError.value = ''
+  ElMessage.success('已退出登录')
+}
+
+function onUserCommand(command) {
+  if (command === 'logout') handleLogout()
+}
+
+// 登录后拉一次基础数据：既预热黑名单，也让 Render 免费实例的冷启动在用户填表单时
+// 就开始唤醒，而不是等用户点了「生成」才开始等 30~60s 的唤醒。
+function loadInitialData() {
+  if (initialDataLoaded) return
+  initialDataLoaded = true
   blacklistPromise = loadUnavailableDomains()
   // 余额也一并拉：既能显示，又顺带把休眠的后端叫醒
   loadBalances()
-})
+}
 
 // 等黑名单就绪，但最多等 BLACKLIST_WAIT_MS。
 // 原实现是在 handleGenerate 里 `await loadUnavailableDomains()`，而那次请求：
@@ -277,7 +460,8 @@ async function handleGenerate({ theme, desc }) {
     // 第一轮：正常生成
     const generatedDomains = await generateAndCollect(theme, desc, '初始生成', excludeList)
     if (generatedDomains.length === 0) {
-      ElMessage.warning('返回结果为空')
+      // 登录态失效时界面已切回登录页，不再叠加「结果为空」的误导提示
+      if (user.value) ElMessage.warning('返回结果为空')
       return
     }
 
@@ -324,7 +508,7 @@ async function handleGenerate({ theme, desc }) {
     await saveUnavailableDomains()
   } catch (e) {
     if (e.name !== 'AbortError' && e.code !== 'ERR_CANCELED') {
-      ElMessage.error('请求失败：' + (e.message || '未知错误'))
+      if (user.value) ElMessage.error('请求失败：' + (e.message || '未知错误'))
     } else {
       ElMessage.warning('已中断生成流程')
     }
@@ -335,8 +519,8 @@ async function handleGenerate({ theme, desc }) {
     historyChecking.value = false
     progressText.value = ''
     abortController = null
-    // 一轮下来会消耗 token，顺手刷新余额
-    loadBalances()
+    // 一轮下来会消耗 token，顺手刷新余额（登录已失效时就没必要再打了）
+    if (user.value) loadBalances()
   }
 }
 
@@ -412,6 +596,8 @@ async function runDomainCheck() {
       ElMessage.warning('域名检测失败：' + (result.message || '未知错误'))
     }
   } catch (e) {
+    // 登录已失效（拦截器已切回登录页）：直接向上抛，终止整条检测流程
+    if (!user.value) throw e
     if (e.name !== 'AbortError' && e.code !== 'ERR_CANCELED') {
       console.error('域名检测出错：', e)
       ElMessage.error('域名检测请求失败：' + (e.message || '未知错误'))
@@ -466,6 +652,7 @@ async function runComplianceCheck(registrableList) {
       )
     }
   } catch (e) {
+    if (!user.value) throw e
     if (e.name !== 'AbortError' && e.code !== 'ERR_CANCELED') {
       console.error('合规检测出错：', e)
       ElMessage.error('合规检测请求失败：' + (e.message || '未知错误'))
@@ -578,6 +765,7 @@ async function runHistoryCheck(registrableList) {
           const result = await checkHistorySource(domainNames, src, abortController?.signal)
           mergeHistoryResult(result)
         } catch (e) {
+          if (!user.value) throw e
           if (e.name === 'AbortError' || e.code === 'ERR_CANCELED') throw e
           console.error(`[history] ${src} 请求失败：`, e)
           markSourceFailed(domainNames, src, '请求失败 - ' + (e.message || '网络异常'))
@@ -618,6 +806,7 @@ async function runHistoryCheck(registrableList) {
         )
         mergeHistoryResult(result)
       } catch (e) {
+        if (!user.value) throw e
         if (e.name === 'AbortError' || e.code === 'ERR_CANCELED') throw e
         console.error('[history] virustotal 请求失败：', e)
         markSourceFailed(vtTargets, 'virustotal', '请求失败 - ' + (e.message || '网络异常'))
@@ -633,6 +822,7 @@ async function runHistoryCheck(registrableList) {
       ElMessage.success('历史痕迹检测完成：未发现使用痕迹')
     }
   } catch (e) {
+    if (!user.value) throw e
     if (e.name !== 'AbortError' && e.code !== 'ERR_CANCELED') {
       console.error('历史痕迹检测出错：', e)
       ElMessage.error('历史痕迹检测请求失败：' + (e.message || '未知错误'))
@@ -722,8 +912,9 @@ async function saveUnavailableDomains() {
 }
 
 .topbar {
-  height: 56px;
-  padding: 0 20px;
+  min-height: 56px;
+  height: auto;
+  padding: 8px 20px;
   background: #fff;
   border-bottom: 1px solid #e4e7ed;
   display: flex;
@@ -751,6 +942,84 @@ async function saveUnavailableDomains() {
 .app-title {
   font-size: 16px;
   font-weight: 600;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px 4px 4px;
+  border-radius: 999px;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.18s ease;
+}
+
+.user-chip:hover {
+  background: #f2f5fb;
+}
+
+.user-avatar {
+  flex: none;
+  background: #3370ff;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.user-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: #303133;
+}
+
+.user-caret {
+  font-size: 11px;
+  color: #a8b0bf;
+}
+
+/* 首屏确定登录态时的占位（避免闪一下登录页或主界面） */
+.auth-boot {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(900px 520px at 16% 6%, rgba(51, 112, 255, 0.16), transparent 62%),
+    #f5f7fa;
+}
+
+.auth-boot-card {
+  text-align: center;
+}
+
+.auth-boot-logo {
+  font-size: 40px;
+  line-height: 1;
+}
+
+.auth-boot-title {
+  margin-top: 12px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #1f2d3d;
+}
+
+.auth-boot-tip {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #8a94a6;
 }
 
 .balance-box {
